@@ -31,6 +31,7 @@ enum NotchAgentTests {
         AgentUsageArchiveSettleTests.run(suite)
         AgentUsageArchiveSaveTests.run(suite)
         claudeApp(suite)
+        cursorUsage(suite)
         AgentCodexResetTests.run(suite)
         preferences(suite)
         formatting(suite)
@@ -2379,6 +2380,69 @@ enum NotchAgentTests {
 
     // MARK: Preferences and layout
 
+    private static func cursorUsage(_ suite: TestSuite) {
+        let observed = Date(timeIntervalSince1970: 1_700_000_000)
+        let end = String(Int((observed.timeIntervalSince1970 + 86_400) * 1000))
+        let usage: [String: Any] = [
+            "billingCycleEnd": end,
+            "planUsage": [
+                "includedSpend": 2000,
+                "limit": 2000,
+                "autoPercentUsed": 12.0,
+                "apiPercentUsed": 40.0,
+            ],
+            "spendLimitUsage": [
+                "individualLimit": 5000,
+                "individualUsed": 1250,
+            ],
+        ]
+        let plan: [String: Any] = ["planInfo": ["planName": "Pro", "price": "$20/mo"]]
+        let reading = AgentCursorUsage.reading(usage: usage, plan: plan, observed: observed)
+        suite.expect(reading?.plan?.name == "Pro" && reading?.plan?.monthlyPrice == 20
+                        && reading?.limits.windows.first { $0.id == AgentCursorUsage.includedID }?.usedPercent == 100
+                        && reading?.limits.windows.first { $0.id == AgentCursorUsage.onDemandID }?.usedPercent == 25
+                        && reading?.limits.windows.first { $0.id == AgentCursorUsage.includedID }?.resetsAt
+                            == Date(timeIntervalSince1970: observed.timeIntervalSince1970 + 86_400),
+                     "Cursor reports included usage, the on-demand cap, the plan and when they renew")
+        suite.expect(AgentCursorUsage.displayed(reading?.limits.windows ?? []).map(\.id)
+                        == [AgentCursorUsage.includedID, AgentCursorUsage.onDemandID],
+                     "the card keeps included usage and the spend cap")
+        let codingOnly = AgentCursorUsage.reading(usage: [
+            "billingCycleEnd": end,
+            "planUsage": ["includedSpend": 500, "limit": 2000, "autoPercentUsed": 12, "apiPercentUsed": 40],
+        ], plan: nil, observed: observed)
+        suite.expect(AgentCursorUsage.displayed(codingOnly?.limits.windows ?? []).map(\.id)
+                        == [AgentCursorUsage.includedID, AgentCursorUsage.apiID]
+                        && NotchAgentSupport.tiles(cards: [.limits], providers: [.cursor]).map(\.provider) == [.cursor],
+                     "without a spend cap the card shows included usage and the fuller coding bucket")
+        suite.expect(AgentCursorUsage.reading(usage: [:], plan: nil, observed: observed) == nil,
+                     "an empty Cursor account reading is ignored")
+
+        let folder = FileManager.default.temporaryDirectory.appending(path: "vorss-cursor-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let database = folder.appending(path: "state.vscdb")
+        var handle: OpaquePointer?
+        defer { sqlite3_close(handle) }
+        let token = "cursor-test-token-value-0000000001"
+        suite.expect(sqlite3_open(database.path, &handle) == SQLITE_OK
+                        && sqlite3_exec(handle, "CREATE TABLE ItemTable (key TEXT, value TEXT)", nil, nil, nil) == SQLITE_OK
+                        && sqlite3_exec(handle, "INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', '\"\(token)\"')",
+                                        nil, nil, nil) == SQLITE_OK
+                        && AgentCursorUsage.accessToken(database: database) == token,
+                     "Cursor's stored sign-in is read and unquoted")
+        sqlite3_close(handle)
+        handle = nil
+        let bare = folder.appending(path: "bare.vscdb")
+        suite.expect(sqlite3_open(bare.path, &handle) == SQLITE_OK
+                        && sqlite3_exec(handle, "CREATE TABLE ItemTable (key TEXT, value TEXT)", nil, nil, nil) == SQLITE_OK
+                        && sqlite3_exec(handle, "INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', '\(token)')",
+                                        nil, nil, nil) == SQLITE_OK
+                        && AgentCursorUsage.accessToken(database: bare) == token
+                        && AgentCursorUsage.accessToken(database: folder.appending(path: "missing.vscdb")) == nil,
+                     "a plain sign-in is kept, and a missing database is left alone")
+    }
+
     private static func preferences(_ suite: TestSuite) {
         let domain = "com.vorssaint.tests.notch-agents"
         let defaults = UserDefaults(suiteName: domain)!
@@ -2414,11 +2478,13 @@ enum NotchAgentTests {
         suite.expect(NotchAgentSupport.cards(in: defaults) == [.trend, .spend, .limits, .live, .models, .resets],
                      "the saved order ignores unknown and repeated cards and appends new ones")
         defaults.set(false, forKey: DefaultsKey.notchAgentsCodex)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .opencode, .copilot], "an agent can be left out")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .opencode, .copilot, .cursor], "an agent can be left out")
         defaults.set(false, forKey: DefaultsKey.notchAgentsOpenCode)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .copilot], "OpenCode keeps its own preference")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .copilot, .cursor], "OpenCode keeps its own preference")
         defaults.set(false, forKey: DefaultsKey.notchAgentsCopilot)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude], "multiple agents can be left out")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .cursor], "multiple agents can be left out")
+        defaults.set(false, forKey: DefaultsKey.notchAgentsCursor)
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude], "Cursor keeps its own preference")
         defaults.set("unknown", forKey: DefaultsKey.notchAgentsLimitFocus)
         suite.expect(NotchAgentSupport.limitFocus(in: defaults) == .mostUsed, "an unknown limit choice shows the most used")
         defaults.set(NotchAgentLimitFocus.weekly.rawValue, forKey: DefaultsKey.notchAgentsLimitFocus)
@@ -2431,7 +2497,7 @@ enum NotchAgentTests {
                      "alerts follow their switches and a budget must be positive")
 
         let keys = [DefaultsKey.notchAgentsEnabled, DefaultsKey.notchAgentsClaude, DefaultsKey.notchAgentsCodex,
-                    DefaultsKey.notchAgentsOpenCode, DefaultsKey.notchAgentsCopilot,
+                    DefaultsKey.notchAgentsOpenCode, DefaultsKey.notchAgentsCopilot, DefaultsKey.notchAgentsCursor,
                     DefaultsKey.notchAgentsCardOrder, DefaultsKey.notchAgentsHiddenCards, DefaultsKey.notchAgentsPeriod,
                     DefaultsKey.notchAgentsLimitDisplay, DefaultsKey.notchAgentsLimitFocus, DefaultsKey.notchAgentsLiveActivity, DefaultsKey.notchAgentsReadout,
                     DefaultsKey.notchAgentsFinishAlert, DefaultsKey.notchAgentsFinishMinimum, DefaultsKey.notchAgentsLimitAlert,

@@ -176,8 +176,8 @@ extension FeatureStrings {
 extension NotchAgentStrings {
     static let enUS = NotchAgentStrings(
         title: "AI Agents",
-        hubDescription: "Follow plan limits, tokens, API value and the work in progress of Claude, Codex, OpenCode and GitHub Copilot in the Dynamic Island.",
-        settingsDescription: "Reads the usage Claude Code, Codex, OpenCode and GitHub Copilot record on this Mac and the plan limits the Claude app saves. Prompts, replies and files are never kept, and your usage never leaves your Mac.",
+        hubDescription: "Follow plan limits, tokens, API value and the work in progress of Claude, Codex, OpenCode, GitHub Copilot and Cursor in the Dynamic Island.",
+        settingsDescription: "Reads the usage Claude Code, Codex, OpenCode and GitHub Copilot record on this Mac, the plan limits the Claude app saves, and Cursor's included usage and spend limit. Prompts, replies and files are never kept. Cursor's sign-in is sent only to Cursor.",
         restingTitle: "AI limits",
         limitsCard: "Limits",
         spendCard: "Spending",

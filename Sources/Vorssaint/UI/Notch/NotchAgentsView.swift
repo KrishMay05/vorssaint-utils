@@ -16,13 +16,15 @@ struct NotchAgentsView: View {
     @AppStorage(DefaultsKey.notchAgentsCodex) private var codex = true
     @AppStorage(DefaultsKey.notchAgentsOpenCode) private var opencode = true
     @AppStorage(DefaultsKey.notchAgentsCopilot) private var copilot = true
+    @AppStorage(DefaultsKey.notchAgentsCursor) private var cursor = true
 
     private var text: NotchAgentStrings { FeatureStrings.notchAgents(l10n.language) }
     private var chosenPeriod: AgentPeriod { AgentPeriod(rawValue: period) ?? .today }
 
     /// Only agents that left something on this Mac get cards.
     private var providers: [AgentProvider] {
-        [claude ? AgentProvider.claude : nil, codex ? .codex : nil, opencode ? .opencode : nil, copilot ? .copilot : nil].compactMap { $0 }
+        [claude ? AgentProvider.claude : nil, codex ? .codex : nil, opencode ? .opencode : nil,
+         copilot ? .copilot : nil, cursor ? .cursor : nil].compactMap { $0 }
             .filter(usage.snapshot.seen.contains)
     }
 
@@ -136,8 +138,11 @@ private struct NotchAgentLimitsCard: View {
     }
 
     /// Two rows fit: the session and whichever longer window binds first.
+    /// Cursor's rows are the included allowance and either the spend cap or
+    /// the fuller coding bucket.
     private var windows: [AgentLimitWindow] {
         let all = (snapshot.limits[provider]?.windows ?? []).map { AgentLimitSupport.current($0, at: now) }
+        if provider == .cursor { return AgentCursorUsage.displayed(all) }
         let session = all.first { $0.kind == .session }
         let longer = all.filter { $0.kind != .session }.max { $0.usedPercent < $1.usedPercent }
         return [session, longer].compactMap { $0 }
@@ -222,7 +227,8 @@ private struct NotchAgentLimitsCard: View {
         case .session: return text.session
         case .weekly: return window.scope.map { "\(text.weekly) · \($0)" } ?? text.weekly
         case .other:
-            guard let minutes = window.minutes else { return window.scope ?? text.readoutLimit }
+            if let scope = window.scope, !scope.isEmpty { return scope }
+            guard let minutes = window.minutes else { return text.readoutLimit }
             return AgentFormat.duration(TimeInterval(minutes) * 60, locale: locale, units: 1)
         }
     }

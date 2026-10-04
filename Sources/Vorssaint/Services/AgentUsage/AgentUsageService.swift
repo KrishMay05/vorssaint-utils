@@ -10,8 +10,9 @@ import Foundation
 /// incrementally, and nothing is copied or sent: only counters are kept, in
 /// memory and in the app's private folder so the next launch reads only what
 /// the agents wrote meanwhile. OpenCode's stay in memory only, and its
-/// database is read again at each launch. The one request it makes fetches
-/// the public price list, when the person keeps prices up to date.
+/// database is read again at each launch. It also asks Cursor for the included
+/// usage and spend limit of the account already signed in on this Mac, and
+/// fetches the public price list when the person keeps prices up to date.
 ///
 /// Reading happens on a private queue; the main thread and that queue hand
 /// work to each other asynchronously, except that a stop waits for progress
@@ -78,6 +79,14 @@ final class AgentUsageService: ObservableObject {
     /// The last snapshot handed over, to tell when time alone changes it.
     private var published = AgentUsageSnapshot()
     private var claudePlan: AgentPlan?
+    /// Cursor's plan name, from the same account reading as its limits.
+    private var cursorPlan: AgentPlan?
+    /// Cursor account checks run off the log queue. Main thread only.
+    private let cursorQueue = DispatchQueue(label: "com.vorssaint.cursor-usage", qos: .utility)
+    private var cursorGeneration = 0
+    private var cursorChecking = false
+    private var cursorAttempted = Date.distantPast
+    private var cursorFailed = false
     /// The organization Claude Code signs in to, when its profile says.
     private var claudeOrganization: String?
     private var claudeProfileModified: Date?
@@ -114,6 +123,7 @@ final class AgentUsageService: ObservableObject {
             resume()
         }
         syncPrices()
+        refreshCursorIfStale()
     }
 
     /// Stops reading while the island is away, as with the display asleep or
@@ -149,6 +159,10 @@ final class AgentUsageService: ObservableObject {
     func stop(keepingProgress keeps: Bool = true) {
         // A first read still going stops at its next chunk, so the wait
         // below is short.
+        cursorGeneration += 1
+        cursorChecking = false
+        cursorFailed = false
+        cursorAttempted = .distantPast
         if running { cancellation.cancel() }
         settleArchive(keeping: keeps && NotchAgentSupport.isEnabled())
         guard running else { return }
@@ -177,6 +191,7 @@ final class AgentUsageService: ObservableObject {
             warned.removeAll()
             budgetDay = nil
             claudePlan = nil
+            cursorPlan = nil
             claudeOrganization = nil
             claudeProfileModified = nil
             claudeAppModified = nil
@@ -198,9 +213,48 @@ final class AgentUsageService: ObservableObject {
         }
     }
 
+    /// A Cursor account reading, newer than whatever the logs last said.
+    func noteCursorReading(_ reading: AgentCursorUsage.Reading) {
+        guard running else { return }
+        queue.async { [self] in
+            guard readerSession >= 0, enabled.contains(.cursor) else { return }
+            cursorPlan = reading.plan
+            store.updateLimits(reading.limits)
+            checkLimits()
+            schedulePublish()
+        }
+    }
+
+    /// Asks Cursor again once the last reading is old. Main thread.
+    private func refreshCursorIfStale() {
+        guard running, !paused, !cursorChecking, providers.contains(.cursor) else { return }
+        let now = Date()
+        let wait = cursorFailed ? 60.0 : AgentCursorUsage.freshness
+        guard now.timeIntervalSince(cursorAttempted) >= wait else { return }
+        cursorChecking = true
+        cursorAttempted = now
+        cursorGeneration += 1
+        let generation = cursorGeneration
+        cursorQueue.async { [weak self] in
+            let reading = AgentCursorUsage.load()
+            DispatchQueue.main.async {
+                guard let self, self.running, generation == self.cursorGeneration else { return }
+                self.cursorChecking = false
+                if let reading {
+                    self.cursorFailed = false
+                    self.noteCursorReading(reading)
+                } else {
+                    self.cursorFailed = true
+                    self.cursorAttempted = Date().addingTimeInterval(-(AgentCursorUsage.freshness - 60))
+                }
+            }
+        }
+    }
+
     /// Opening the page shows the latest limits the Claude app saved.
     func pageDidAppear() {
         guard running else { return }
+        refreshCursorIfStale()
         queue.async { [self] in
             guard readerSession >= 0 else { return }
             readClaudeApp(now: Date())
@@ -387,6 +441,7 @@ final class AgentUsageService: ObservableObject {
             case .codex: entries = AgentLogParser.parseCodex(line, state: &cursor.state, now: now)
             case .opencode: entries = AgentLogParser.parseOpenCode(line, state: &cursor.state, now: now)
             case .copilot: entries = AgentLogParser.parseCopilot(line, state: &cursor.state, now: now)
+            case .cursor: entries = []
             }
             guard !entries.isEmpty else { return }
             changed = true
@@ -452,6 +507,7 @@ final class AgentUsageService: ObservableObject {
 
     private func tickTimer() {
         guard running else { return }
+        refreshCursorIfStale()
         syncPrices()
         queue.async { [self] in
             guard readerSession >= 0 else { return }
@@ -493,6 +549,7 @@ final class AgentUsageService: ObservableObject {
         let limits: [AgentProvider: AgentLimits]
         let codexPlan: String?
         let claudePlan: AgentPlan?
+        let cursorPlan: AgentPlan?
         let claudeOrganization: String?
         let claudeApp: [AgentClaudeAppUsage.Sample]
     }
@@ -500,7 +557,8 @@ final class AgentUsageService: ObservableObject {
     /// Runs on `queue`.
     private var inputs: Inputs {
         Inputs(records: store.records.count, turns: store.turns, limits: store.limits, codexPlan: store.codexPlan,
-               claudePlan: claudePlan, claudeOrganization: claudeOrganization, claudeApp: claudeAppSamples)
+               claudePlan: claudePlan, cursorPlan: cursorPlan, claudeOrganization: claudeOrganization,
+               claudeApp: claudeAppSamples)
     }
 
     /// Runs on `queue` and hands the finished snapshot to the main thread.
@@ -509,6 +567,7 @@ final class AgentUsageService: ObservableObject {
         guard session >= 0 else { return }
         var plans: [AgentProvider: AgentPlan] = [:]
         if let claudePlan { plans[.claude] = claudePlan }
+        if let cursorPlan { plans[.cursor] = cursorPlan }
         if let codex = AgentPlans.codex(planType: store.codexPlan) { plans[.codex] = codex }
         let next = store.snapshot(plans: plans, providers: enabled, now: Date())
         published = next
